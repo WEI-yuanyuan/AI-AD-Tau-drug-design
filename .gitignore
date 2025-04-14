@@ -1,0 +1,11 @@
+__pycache__/
+IPDiff/notebooks/
+IPDiff/eval_results/
+IPDiff/nohup_outputs/
+IPDiff/sampled_results/
+
+sampled_results/
+pockets/*.pdbqt
+temp/
+
+notebooks/temp/
