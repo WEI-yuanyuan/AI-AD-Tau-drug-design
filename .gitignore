@@ -5,7 +5,10 @@ IPDiff/nohup_outputs/
 IPDiff/sampled_results/
 
 sampled_results/
+results/
 pockets/*.pdbqt
 temp/
+nohup_outputs/
+logs_diffusion/
 
 notebooks/temp/

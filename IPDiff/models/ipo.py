@@ -195,7 +195,7 @@ class SinusoidalPosEmb(nn.Module):
 
 
 # Model
-class ScorePosNet3D(nn.Module):
+class DPO3D(nn.Module):
 
     def __init__(self, config, protein_atom_feature_dim, ligand_atom_feature_dim):
         super().__init__()
@@ -464,7 +464,226 @@ class ScorePosNet3D(nn.Module):
         loss_v = scatter_mean(mask * decoder_nll_v + (1. - mask) * kl_v, batch, dim=0)
         return loss_v
 
+
+
     def get_diffusion_loss(
+            self, dpo_beta, ref_model, net_cond, 
+            protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, 
+            protein_pos2, protein_v2, batch_protein2, ligand_pos2, ligand_v2, batch_ligand2, time_step=None,
+            reward=1e6, reward2=0, beta_reward=6.6
+    ):
+        num_graphs = batch_protein.max().item() + 1
+
+
+        rewards = torch.stack([reward, reward2], dim=1)
+        rewards = F.softmax(rewards * beta_reward, dim=1)
+        # print(rewards)
+
+
+        protein_pos, ligand_pos, _ = center_pos(
+            protein_pos, ligand_pos, batch_protein, batch_ligand, mode=self.center_pos_mode)
+        protein_pos2, ligand_pos2, _ = center_pos(
+            protein_pos2, ligand_pos2, batch_protein2, batch_ligand2, mode=self.center_pos_mode)
+
+
+        hbap_ligand = None
+        hbap_protein = None
+        if self.model_mean_type == 'noise':
+            pass
+        elif self.model_mean_type == 'C0':
+            gt_protein_v = protein_v
+            gt_protein_pos = protein_pos
+            gt_ligand_v = ligand_v
+            gt_ligand_pos = ligand_pos
+
+            gt_lig_a_h = gt_ligand_v
+            gt_protein_a_h = torch.argmax(gt_protein_v[:, :6], dim=1)
+            gt_protein_r_h = torch.argmax(gt_protein_v[:, 6:26], dim=1)
+
+            hbap_ligand, hbap_protein = net_cond.extract_features(gt_ligand_pos, gt_protein_pos, gt_lig_a_h, gt_protein_a_h, gt_protein_r_h, batch_ligand, batch_protein)
+
+            gt_protein_v2 = protein_v2
+            gt_protein_pos2 = protein_pos2
+            gt_ligand_v2 = ligand_v2
+            gt_ligand_pos2 = ligand_pos2
+
+            gt_lig_a_h2 = gt_ligand_v2
+            gt_protein_a_h2 = torch.argmax(gt_protein_v2[:, :6], dim=1)
+            gt_protein_r_h2 = torch.argmax(gt_protein_v2[:, 6:26], dim=1)
+
+            hbap_ligand2, hbap_protein2 = net_cond.extract_features(gt_ligand_pos2, gt_protein_pos2, gt_lig_a_h2, gt_protein_a_h2, gt_protein_r_h2, batch_ligand2, batch_protein2)
+        else:
+            raise ValueError
+
+
+        if time_step is None:
+            time_step, pt = self.sample_time(num_graphs, protein_pos.device, self.sample_time_method)
+        else:
+            pt = torch.ones_like(time_step).float() / self.num_timesteps
+        a = self.alphas_cumprod.index_select(0, time_step)
+
+        k_t = self.k_t.index_select(0, time_step)
+        k_t_pos = k_t[batch_ligand].unsqueeze(-1)
+        a_pos = a[batch_ligand].unsqueeze(-1)
+        pos_noise = torch.zeros_like(ligand_pos)
+        pos_noise.normal_()
+
+        shift_cond_t = torch.cat([hbap_ligand, time_step[batch_ligand].unsqueeze(-1)], -1)
+        shift_cond_t = self.shift_t_mlp_pos(shift_cond_t)
+        ligand_pos_perturbed = a_pos.sqrt() * ligand_pos + (1.0 - a_pos).sqrt() * pos_noise + k_t_pos * shift_cond_t
+        log_ligand_v0 = index_to_log_onehot(ligand_v, self.num_classes)
+        ligand_v_perturbed, log_ligand_vt = self.q_v_sample(log_ligand_v0, time_step, batch_ligand)
+
+
+        k_t_pos2 = k_t[batch_ligand2].unsqueeze(-1)
+        a_pos2 = a[batch_ligand2].unsqueeze(-1)
+        pos_noise2 = torch.zeros_like(ligand_pos2)
+        pos_noise2.normal_()
+
+        shift_cond_t2 = torch.cat([hbap_ligand2, time_step[batch_ligand2].unsqueeze(-1)], -1)
+        shift_cond_t2 = self.shift_t_mlp_pos(shift_cond_t2)
+        ligand_pos_perturbed2 = a_pos2.sqrt() * ligand_pos2 + (1.0 - a_pos2).sqrt() * pos_noise2 + k_t_pos2 * shift_cond_t2
+        log_ligand_v02 = index_to_log_onehot(ligand_v2, self.num_classes)
+        ligand_v_perturbed2, log_ligand_vt2 = self.q_v_sample(log_ligand_v02, time_step, batch_ligand2)
+
+
+
+        preds = self(
+            protein_pos=protein_pos,
+            protein_v=protein_v,
+            batch_protein=batch_protein,
+
+            init_ligand_pos=ligand_pos_perturbed,
+            init_ligand_v=ligand_v_perturbed,
+            batch_ligand=batch_ligand,
+            time_step=time_step,
+
+            hbap_protein=hbap_protein,
+            hbap_ligand=hbap_ligand
+        )
+
+        preds2 = self(
+            protein_pos=protein_pos2,
+            protein_v=protein_v2,
+            batch_protein=batch_protein2,
+
+            init_ligand_pos=ligand_pos_perturbed2,
+            init_ligand_v=ligand_v_perturbed2,
+            batch_ligand=batch_ligand2,
+            time_step=time_step,
+
+            hbap_protein=hbap_protein2,
+            hbap_ligand=hbap_ligand2
+        )
+
+        ref_preds = ref_model.forward(
+            protein_pos=protein_pos,
+            protein_v=protein_v,
+            batch_protein=batch_protein,
+
+            init_ligand_pos=ligand_pos_perturbed,
+            init_ligand_v=ligand_v_perturbed,
+            batch_ligand=batch_ligand,
+            time_step=time_step,
+
+            hbap_protein=hbap_protein,
+            hbap_ligand=hbap_ligand
+        )
+
+        ref_preds2 = ref_model.forward(
+            protein_pos=protein_pos2,
+            protein_v=protein_v2,
+            batch_protein=batch_protein2,
+
+            init_ligand_pos=ligand_pos_perturbed2,
+            init_ligand_v=ligand_v_perturbed2,
+            batch_ligand=batch_ligand2,
+            time_step=time_step,
+
+            hbap_protein=hbap_protein2,
+            hbap_ligand=hbap_ligand2
+        )
+
+        pred_ligand_pos, pred_ligand_v = preds['pred_ligand_pos'], preds['pred_ligand_v']
+        pred_pos_noise = pred_ligand_pos - ligand_pos_perturbed
+
+        pred_ligand_pos2, pred_ligand_v2 = preds2['pred_ligand_pos'], preds2['pred_ligand_v']
+        pred_pos_noise2 = pred_ligand_pos2 - ligand_pos_perturbed2
+
+        ref_pred_ligand_pos, ref_pred_ligand_v = ref_preds['pred_ligand_pos'], ref_preds['pred_ligand_v']
+        ref_pred_pos_noise = ref_pred_ligand_pos - ligand_pos_perturbed
+
+        ref_pred_ligand_pos2, ref_pred_ligand_v2 = ref_preds2['pred_ligand_pos'], ref_preds2['pred_ligand_v']
+        ref_pred_pos_noise2 = ref_pred_ligand_pos2 - ligand_pos_perturbed2
+
+        if self.model_mean_type == 'C0':
+            #target, pred = ligand_pos, pred_ligand_pos
+            target, pred, ref_pred = ligand_pos, pred_ligand_pos, ref_pred_ligand_pos
+            target2, pred2, ref_pred2 = ligand_pos2, pred_ligand_pos2, ref_pred_ligand_pos2
+        elif self.model_mean_type == 'noise':
+            #target, pred = pos_noise, pred_pos_noise
+            target, pred, ref_pred = pos_noise, pred_pos_noise, ref_pred_pos_noise
+            target2, pred2, ref_pred2 = pos_noise2, pred_pos_noise2, ref_pred_pos_noise2
+        else:
+            raise ValueError
+
+        pos_w_diff = scatter_mean(((pred - target) ** 2).sum(-1), batch_ligand, dim=0) 
+        pos_w_diff_ref = scatter_mean(((ref_pred - target) ** 2).sum(-1), batch_ligand, dim=0)
+
+        pos_l_diff = scatter_mean(((pred2 - target2) ** 2).sum(-1), batch_ligand2, dim=0) 
+        pos_l_diff_ref = scatter_mean(((ref_pred2 - target2) ** 2).sum(-1), batch_ligand2, dim=0)
+        # print(f'\ndpo_diff: {dpo_l_diff.detach().cpu().numpy()}, ref_diff: {ref_l_diff.detach().cpu().numpy()}')
+        loss_pos = (pos_w_diff - pos_w_diff_ref) - (pos_l_diff - pos_l_diff_ref)
+        # loss_pos = torch.mean(-F.logsigmoid(-1 * dpo_beta * loss_pos))
+        loss_pos = torch.mean(rewards[:, 0] * (-F.logsigmoid(-1 * dpo_beta * loss_pos)) +  \
+                            rewards[:, 1] * (-F.logsigmoid(dpo_beta * loss_pos)))
+        
+
+        log_ligand_v_recon = F.log_softmax(pred_ligand_v, dim=-1)
+        log_v_model_prob = self.q_v_posterior(log_ligand_v_recon, log_ligand_vt, time_step, batch_ligand)
+        log_v_true_prob = self.q_v_posterior(log_ligand_v0, log_ligand_vt, time_step, batch_ligand)
+        kl_v = self.compute_v_Lt(log_v_model_prob=log_v_model_prob, log_v0=log_ligand_v0,
+                                 log_v_true_prob=log_v_true_prob, t=time_step, batch=batch_ligand)
+        ref_log_ligand_v_recon = F.log_softmax(ref_pred_ligand_v, dim=-1)
+        ref_log_v_model_prob = self.q_v_posterior(ref_log_ligand_v_recon, log_ligand_vt, time_step, batch_ligand)
+        kl_v_ref = self.compute_v_Lt(log_v_model_prob=ref_log_v_model_prob, log_v0=log_ligand_v0, 
+                                     log_v_true_prob=log_v_true_prob, t=time_step, batch=batch_ligand)
+        
+
+        log_ligand_v_recon2 = F.log_softmax(pred_ligand_v2, dim=-1)
+        log_v_model_prob2 = self.q_v_posterior(log_ligand_v_recon2, log_ligand_vt2, time_step, batch_ligand2)
+        log_v_true_prob2 = self.q_v_posterior(log_ligand_v02, log_ligand_vt2, time_step, batch_ligand2)
+        kl_v2 = self.compute_v_Lt(log_v_model_prob=log_v_model_prob2, log_v0=log_ligand_v02, 
+                                  log_v_true_prob=log_v_true_prob2, t=time_step, batch=batch_ligand2)
+        ref_log_ligand_v_recon2 = F.log_softmax(ref_pred_ligand_v2, dim=-1)
+        ref_log_v_model_prob2 = self.q_v_posterior(ref_log_ligand_v_recon2, log_ligand_vt2, time_step, batch_ligand2)
+        kl_v2_ref  =  self.compute_v_Lt(log_v_model_prob=ref_log_v_model_prob2, log_v0=log_ligand_v02, 
+                                        log_v_true_prob=log_v_true_prob2, t=time_step, batch=batch_ligand2)
+
+        loss_v = (kl_v - kl_v_ref) - (kl_v2 - kl_v2_ref)
+        # loss_v = torch.mean(-F.logsigmoid(-1 * dpo_beta * loss_v))
+        loss_v = torch.mean(rewards[:, 0] * (-F.logsigmoid(-1 * dpo_beta * loss_v)) +  \
+                        rewards[:, 1] * (-F.logsigmoid(dpo_beta * loss_v)))
+        loss = loss_pos + loss_v * self.loss_v_weight
+
+        return {
+            'loss_pos': loss_pos,
+            'loss_v': loss_v,
+            'loss': loss,
+            'x0': ligand_pos,
+            'pred_ligand_pos': pred_ligand_pos,
+            'pred_ligand_v': pred_ligand_v,
+            'pred_pos_noise': pred_pos_noise,
+            'ligand_v_recon': F.softmax(pred_ligand_v, dim=-1),
+            'x02': ligand_pos2,
+            'pred_ligand_pos2': pred_ligand_pos2,
+            'pred_ligand_v2': pred_ligand_v2,
+            'pred_pos_noise2': pred_pos_noise2,
+            'ligand_v_recon2': F.softmax(pred_ligand_v2, dim=-1)
+        }
+       
+
+    def get_diffusion_loss_org(
             self, net_cond, protein_pos, protein_v, batch_protein, ligand_pos, ligand_v, batch_ligand, time_step=None
     ):
         num_graphs = batch_protein.max().item() + 1
@@ -558,7 +777,6 @@ class ScorePosNet3D(nn.Module):
     @torch.no_grad()
     def sample_diffusion(self, protein_pos, protein_v, batch_protein,
                          init_ligand_pos, init_ligand_v, batch_ligand,
-                         pos_shifter=None, # add-on: shift the ligand pos towards the center of the protein
                          num_steps=None, center_pos_mode=None, pos_only=False, net_cond=None, cond_dim=128):
 
         if num_steps is None:
@@ -614,11 +832,6 @@ class ScorePosNet3D(nn.Module):
 
             ligand_pos_next = pos_model_mean + nonzero_mask * (0.5 * pos_log_variance).exp() * torch.randn_like(ligand_pos)
             ligand_pos = ligand_pos_next
-            if pos_shifter is not None:
-                ligand_pos_new = pos_shifter(ligand_pos, protein_center=protein_pos.mean(0))
-                if torch.any(torch.abs(ligand_pos_new - ligand_pos) > 1e-2):
-                    print(f'position shifted: {torch.where(torch.abs(ligand_pos_new - ligand_pos) > 1e-2)[0]}')
-                ligand_pos = ligand_pos_new
 
             gt_protein_pos = protein_pos.detach()
             gt_protein_v = protein_v.detach()

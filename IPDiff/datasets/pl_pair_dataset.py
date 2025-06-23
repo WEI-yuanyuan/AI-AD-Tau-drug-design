@@ -3,27 +3,29 @@ import pickle
 import lmdb
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
-
+import torch
 from utils.data import PDBProtein, parse_sdf_file
 from .pl_data import ProteinLigandData, torchify_dict
 
 
 class PocketLigandPairDataset(Dataset):
 
-    def __init__(self, raw_path, transform=None, version='final'):
+    def __init__(self, raw_path, transform=None, version='final', reprocess=False):
         super().__init__()
-        self.raw_path = raw_path.rstrip('/')
+        self.raw_path = raw_path
         self.index_path = os.path.join(self.raw_path, 'index.pkl')
-        self.processed_path = os.path.join(os.path.dirname(self.raw_path),
-                                           os.path.basename(self.raw_path) + f'_pocket10_processed_{version}.lmdb')
+        self.processed_path = os.path.join(self.raw_path, f'processed_database_{version}.lmdb')
+        self.skipped_indices_path = os.path.join(self.raw_path, 'processed_skipped_indices.pt')
         self.transform = transform
         self.db = None
 
         self.keys = None
 
-        if not os.path.exists(self.processed_path):
-            print(f'{self.processed_path} does not exist, begin processing data')
+        if reprocess or not os.path.exists(self.processed_path) or not os.path.exists(self.skipped_indices_path):
+            print(f'Reprocessing specified or processed data does not exist, begin processing data')
             self._process()
+        else:
+            self.skipped_indices = torch.load(self.skipped_indices_path)
 
     def _connect_db(self):
         """
@@ -47,7 +49,7 @@ class PocketLigandPairDataset(Dataset):
         self.db.close()
         self.db = None
         self.keys = None
-        
+
     def _process(self):
         db = lmdb.open(
             self.processed_path,
@@ -59,6 +61,7 @@ class PocketLigandPairDataset(Dataset):
         with open(self.index_path, 'rb') as f:
             index = pickle.load(f)
 
+        self.skipped_indices = []
         num_skipped = 0
         with db.begin(write=True, buffers=True) as txn:
             for i, (pocket_fn, ligand_fn, *_) in enumerate(tqdm(index)):
@@ -82,8 +85,12 @@ class PocketLigandPairDataset(Dataset):
                 except:
                     num_skipped += 1
                     print('Skipping (%d) %s' % (num_skipped, ligand_fn, ))
+                    self.skipped_indices.append(i)
                     continue
         db.close()
+        
+        print(f'Skipped {num_skipped} indices')
+        torch.save(self.skipped_indices, self.skipped_indices_path)
     
     def __len__(self):
         if self.db is None:
@@ -99,7 +106,11 @@ class PocketLigandPairDataset(Dataset):
     def get_ori_data(self, idx):
         if self.db is None:
             self._connect_db()
-        key = self.keys[idx]
+        ### Old version: 
+        # key = self.keys[idx]
+        ### New version with skipped indices: 
+        key = str(idx).encode()
+        assert key in self.keys, f'Key {key} is not valid'
         data = pickle.loads(self.db.begin().get(key))
         data = ProteinLigandData(**data)
         data.id = idx

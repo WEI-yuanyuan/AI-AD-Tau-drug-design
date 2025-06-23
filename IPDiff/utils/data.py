@@ -254,7 +254,7 @@ def parse_sdf_file(path):
         accum_pos += pos[atom_idx] * atom_weight
         accum_mass += atom_weight
     center_of_mass = accum_pos / accum_mass
-    element = np.array(element, dtype=np.int)
+    element = np.array(element, dtype=np.int64)
 
     # in edge_type, we have 1 for single bond, 2 for double bond, 3 for triple bond, and 4 for aromatic bond.
     row, col, edge_type = [], [], []

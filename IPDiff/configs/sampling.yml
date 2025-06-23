@@ -1,5 +1,5 @@
 model:
-  checkpoint: pretrained_models/pretrained_ipdiff.pt
+  checkpoint: /home/adrianchen/AI-AD-Tau-drug-design/IPDiff/pretrained_models/pretrained_ipdiff.pt
 
 sample:
   seed: 2024

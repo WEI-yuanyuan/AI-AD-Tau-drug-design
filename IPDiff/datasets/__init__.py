@@ -13,7 +13,7 @@ def get_dataset(config, *args, **kwargs):
 
     if 'split' in config:
         split = torch.load(config.split)
-        subsets = {k: Subset(dataset, indices=v) for k, v in split.items()}
+        subsets = {k: Subset(dataset, indices=[i for i in v if i not in dataset.skipped_indices]) for k, v in split.items()}
         return dataset, subsets
     else:
         return dataset

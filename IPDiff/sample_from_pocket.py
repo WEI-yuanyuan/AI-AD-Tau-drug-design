@@ -2,6 +2,7 @@ import argparse
 import os
 import shutil
 import time
+from functools import partial
 
 import numpy as np
 import torch
@@ -50,7 +51,9 @@ def unbatch_v_traj(ligand_v_traj, n_data, ligand_cum_atoms):
 def sample_diffusion_ligand_one_batch(
     model, data, batch_size=16, device='cuda:0',
     num_steps=None, pos_only=False, center_pos_mode='protein',
-    sample_num_atoms='prior', net_cond=None, cond_dim=128):
+    sample_num_atoms='prior', net_cond=None, cond_dim=128, 
+    pos_shifter=None, 
+):
     batch = Batch.from_data_list([data.clone() for _ in range(batch_size)], follow_batch=FOLLOW_BATCH).to(device)
 
     t1 = time.time()
@@ -99,7 +102,8 @@ def sample_diffusion_ligand_one_batch(
             pos_only=pos_only,
             center_pos_mode=center_pos_mode,
             net_cond=net_cond,
-            cond_dim=cond_dim
+            cond_dim=cond_dim, 
+            pos_shifter=pos_shifter, 
         )
         ligand_pos, ligand_v, ligand_pos_traj, ligand_v_traj = r['pos'], r['v'], r['pos_traj'], r['v_traj']
         ligand_v0_traj, ligand_vt_traj = r['v0_traj'], r['vt_traj']
@@ -135,6 +139,39 @@ def sample_diffusion_ligand_one_batch(
     return pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, t2 - t1
 
 
+def add_gravitational_offset(
+    batched_pos: torch.Tensor, 
+    protein_center: torch.Tensor, 
+    protein_orth: torch.Tensor = torch.tensor([-0.191, -0.044, 0.981]), # hard-coded for 7upg pocket
+    protein_offset: torch.Tensor = torch.tensor([0, 0, 4.8]), # hard-coded for 7upg pocket
+    reduced_pocket_size: int = 3
+) -> torch.Tensor:
+    """ Add gravitational offset to the ligand positions to keep it in the pocket """
+    assert batched_pos.ndim == 2 and batched_pos.shape[1] == 3
+    
+    protein_center = protein_center.to(batched_pos.device)
+    protein_orth = protein_orth.to(batched_pos.device)
+    protein_offset = protein_offset.to(batched_pos.device)
+    
+    dist_pos = (batched_pos - protein_center) @ protein_orth
+    dist_thresh = reduced_pocket_size / 2 * (protein_offset @ protein_orth)
+    forces = torch.where(
+        torch.abs(torch.stack([dist_pos, dist_pos, dist_pos], axis=1)) > dist_thresh, 
+        -torch.sign(dist_pos)[:, None] * protein_offset, 
+        torch.zeros_like(batched_pos)
+    ) # [N, 3]
+    magnitudes = torch.where(
+        torch.abs(dist_pos) > dist_thresh, 
+        (torch.abs(dist_pos) - dist_thresh) / torch.abs(forces @ protein_orth + 1e-6), # avoid division by zero
+        torch.zeros_like(dist_pos)
+    )[:, None] # [N, 1]
+    
+    # sanity check
+    assert torch.all(torch.abs((batched_pos + magnitudes * forces - protein_center) @ protein_orth) <= dist_thresh + 1e-3)
+    
+    return batched_pos + magnitudes * forces
+
+
 if __name__ == '__main__':
     root_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -146,8 +183,10 @@ if __name__ == '__main__':
                         default=os.path.join(root_dir, 'configs/sampling.yml'))
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--batch_size', type=int, default=25)
-    parser.add_argument('--result_path', type=str, default='./sampled_results')
+    parser.add_argument('--result_path', type=str, default='./results')
     parser.add_argument('--num_samples', type=int, default=1000)
+    parser.add_argument('--add_gravitational_offset', type=bool, default=False)
+    parser.add_argument('--reduced_pocket_size', type=float, default=3)
     args = parser.parse_args()
 
     logger = misc.get_logger('evaluate')
@@ -189,7 +228,9 @@ if __name__ == '__main__':
     if args.num_samples:
         config.sample.num_samples = args.num_samples
     
-    # Result stuff preparation
+    # Result preparation
+    from datetime import datetime
+    date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     result = {
         'data': data, 
         'pred_ligand_pos': [],
@@ -199,14 +240,16 @@ if __name__ == '__main__':
         'time': []
     }
     result_path = os.path.join(args.result_path, os.path.basename(args.pdb_path).split('/')[-1].split('.')[0])
+    result_path = os.path.join(result_path, f'results_{date}')
     os.makedirs(result_path, exist_ok=True)
-    from datetime import datetime
-    date = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     
     # Sampling
     num_batch = int(np.ceil(config.sample.num_samples / args.batch_size))
+    num_total_samples = 0
     for i in tqdm(range(num_batch)):
         n_data = args.batch_size if i < num_batch - 1 else config.sample.num_samples - args.batch_size * (num_batch - 1)
+        center_pos = torch.mean(data.protein_pos, dim=0)
+        pos_shifter = partial(add_gravitational_offset, reduced_pocket_size=args.reduced_pocket_size) if args.add_gravitational_offset else None
         pred_pos, pred_v, pred_pos_traj, pred_v_traj, pred_v0_traj, pred_vt_traj, t = sample_diffusion_ligand_one_batch( 
             model, data, 
             batch_size=n_data, 
@@ -216,7 +259,8 @@ if __name__ == '__main__':
             center_pos_mode=config.sample.center_pos_mode, 
             sample_num_atoms='temp', #config.sample.sample_num_atoms, 
             net_cond=net_cond, 
-            cond_dim=train_config.model.cond_dim
+            cond_dim=train_config.model.cond_dim, 
+            pos_shifter=pos_shifter, 
         )
         result['pred_ligand_pos'].append(pred_pos)
         result['pred_ligand_v'].append(pred_v)
@@ -225,12 +269,13 @@ if __name__ == '__main__':
         result['time'].append(t)
         
         # Remove previous sample
-        if i > 0 and os.path.exists(os.path.join(result_path, f'sample_{date}_{i-1:03d}.yml')):
-            os.remove(os.path.join(result_path, f'sample_{date}_{i-1:03d}.yml'))
-            os.remove(os.path.join(result_path, f'sample_{date}_{i-1:03d}.pt'))
+        if os.path.exists(os.path.join(result_path, f'sample_{num_total_samples:04d}.yml')):
+            os.remove(os.path.join(result_path, f'sample_{num_total_samples:04d}.yml'))
+            os.remove(os.path.join(result_path, f'sample_{num_total_samples:04d}.pt'))
         # Save current sample
-        shutil.copyfile(args.config, os.path.join(result_path, f'sample_{date}_{i:03d}.yml'))
-        torch.save(result, os.path.join(result_path, f'sample_{date}_{i:03d}.pt'))
-        logger.info(f'Sample {i:03d} saved in {result_path}')
+        num_total_samples += n_data
+        shutil.copyfile(args.config, os.path.join(result_path, f'sample_{num_total_samples:04d}.yml'))
+        torch.save(result, os.path.join(result_path, f'sample_{num_total_samples:04d}.pt'))
+        logger.info(f'Samples up to {num_total_samples:04d} saved in {result_path}')
         
     logger.info('Sample done!')
