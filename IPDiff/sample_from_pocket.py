@@ -71,8 +71,8 @@ def sample_diffusion_ligand_one_batch(
             ligand_num_atoms = []
             for _ in range(batch_size):
                 num_atoms = 0
-                while num_atoms < 10 or num_atoms > 40:
-                    num_atoms = np.random.randn() * 10 + 25
+                while num_atoms < 6 or num_atoms > 20:
+                    num_atoms = np.random.randn() * 7 + 13
                 ligand_num_atoms.append(int(num_atoms))
             batch_ligand = torch.repeat_interleave(torch.arange(batch_size), torch.tensor(ligand_num_atoms)).to(device)
         else:
@@ -209,6 +209,11 @@ if __name__ == '__main__':
         protein_featurizer,
     ])
 
+    # NOTE: Modify checkpoint config to grab periodic information
+    ckpt['config'].model.model_type = train_config.model.model_type
+    ckpt['config'].model.periodic_dir = train_config.model.periodic_dir
+    ckpt['config'].model.periodic_rot = train_config.model.periodic_rot
+    
     # Load model
     model = ScorePosNet3D(
         ckpt['config'].model,
